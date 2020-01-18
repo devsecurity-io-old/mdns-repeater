@@ -1,50 +1,29 @@
-# Makefile for mdns-repeater
+SRC = $(wildcard mdns/*.c)
+OBJ = $(SRC:.c=.o)
 
-
-ZIP_NAME = mdns-repeater-$(HGVERSION)
-
-ZIP_FILES = mdns-repeater	\
-			README.txt		\
-			LICENSE.txt
-
-HGVERSION=$(shell git rev-parse HEAD )
-
-CFLAGS=-Wall
+CFLAGS=-std=gnu99 -Wall
 
 ifdef DEBUG
 CFLAGS+= -g
 else
 CFLAGS+= -Os
-LDFLAGS+= -s
 endif
 
-CFLAGS+= -DHGVERSION="\"${HGVERSION}\""
+MDNS_REPEATER_VERSION=$(shell git rev-parse HEAD )
 
-.PHONY: all clean
+CFLAGS+= -DMDNS_REPEATER_VERSION="\"$(MDNS_REPEATER_VERSION)\""
 
+.PHONY: all
 all: mdns-repeater
 
-mdns-repeater.o: _hgversion
+mdns-repeater: $(OBJ) mdns-repeater.o
+	$(CC) -o $@ $^
 
-mdns-repeater: mdns-repeater.o
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ -I. $<
 
-.PHONY: zip
-zip: TMPDIR := $(shell mktemp -d)
-zip: mdns-repeater
-	mkdir $(TMPDIR)/$(ZIP_NAME)
-	cp $(ZIP_FILES) $(TMPDIR)/$(ZIP_NAME)
-	-$(RM) $(CURDIR)/$(ZIP_NAME).zip
-	cd $(TMPDIR) && zip -r $(CURDIR)/$(ZIP_NAME).zip $(ZIP_NAME)
-	-$(RM) -rf $(TMPDIR)
-
-# version checking rules
-.PHONY: dummy
-_hgversion: dummy
-	@echo $(HGVERSION) | cmp -s $@ - || echo $(HGVERSION) > $@
-
+.PHONY: clean
 clean:
-	-$(RM) *.o
-	-$(RM) _hgversion
-	-$(RM) mdns-repeater
-	-$(RM) mdns-repeater-*.zip
-
+	-rm -f $(OBJ)
+	-rm -f mdns-repeater.o
+	-rm -f mdns-repeater

@@ -1,20 +1,21 @@
 /*
  * mdns-repeater.c - mDNS repeater daemon
  * Copyright (C) 2011 Darell Tan
+ * Copyright (C) 2020 Matthias Dettling
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ * You should have received a copy of the GNU General Public License along
+ * with this program; if not, write to the Free Software Foundation, Inc.,
+ * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
  */
 
 #include <sys/socket.h>
@@ -26,15 +27,20 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
-#include <syslog.h>
 #include <unistd.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <errno.h>
 
+#include <mdns/logging.h>
+#include <mdns/pdu.h>
+#include <mdns/header.h>
+#include <mdns/callbacks.h>
+
 #define PACKAGE "mdns-repeater"
+const char package_name[] = PACKAGE;
+
 #define MDNS_ADDR "224.0.0.251"
 #define MDNS_PORT 5353
 
@@ -70,26 +76,289 @@ struct subnet whitelisted_subnets[MAX_SUBNETS];
 
 #define PACKET_SIZE 65536
 void *pkt_data = NULL;
+void *pkt_mod_data = NULL;
+size_t pkt_mod_offset = 0;
+size_t pkt_mod_len = 0;
+bool ipv6_link_local_in_packet = false;
 
 int foreground = 0;
+bool debug = false;
 int shutdown_flag = 0;
 
 char *pid_file = PIDFILE;
 
-void log_message(int loglevel, char *fmt_str, ...) {
-	va_list ap;
-	char buf[2048];
 
-	va_start(ap, fmt_str);
-	vsnprintf(buf, 2047, fmt_str, ap);
-	va_end(ap);
-	buf[2047] = 0;
-
-	if (foreground) {
-		fprintf(stderr, "%s: %s\n", PACKAGE, buf);
-	} else {
-		syslog(loglevel, "%s", buf);
+int
+filtercopy_header_callback_fn(mdns_header_t hdr)
+{
+	if (debug)
+	{
+		print_header_callback_fn(hdr);
 	}
+
+	// reset counters
+	hdr.questions      = 0;
+	hdr.answer_rrs     = 0;
+	hdr.authority_rrs  = 0;
+	hdr.additional_rrs = 0;
+
+	mdns_header_write(pkt_mod_data, PACKET_SIZE, &pkt_mod_offset, hdr);
+
+	return 0;
+}
+
+
+int
+filtercopy_question_callback_fn(string_t name, uint16_t qtype, uint16_t qclass,
+		bool qu_question)
+{
+	if (debug)
+	{
+		print_question_callback_fn(name, qtype, qclass, qu_question);
+	}
+
+	int succ = mdns_question_write(pkt_mod_data, PACKET_SIZE,
+			&pkt_mod_offset, name, qtype, qclass, qu_question);
+
+	if (succ == 0)
+	{
+		size_t off=0;
+		mdns_header_increment_question_counter(pkt_mod_data,
+				PACKET_SIZE, &off);
+	}
+
+	return 0;
+}
+
+
+int
+filtercopy_record_callback_fn(mdns_entry_type_t entry, string_t name,
+		uint16_t rtype, uint16_t rclass, bool cf, uint32_t ttl,
+		const void *data, size_t size, size_t offset, size_t length)
+{
+	int succ = 1;
+
+	char namebuffer[1024];
+	const char* entrytype =
+		(entry == MDNS_ENTRYTYPE_ANSWER) ? "answer" :
+		((entry == MDNS_ENTRYTYPE_AUTHORITY) ? "authority" :
+		((entry == MDNS_ENTRYTYPE_ADDITIONAL) ? "additional": "?"));
+
+	if (rtype == MDNS_RECORDTYPE_PTR) {
+		string_t namestr;
+
+		namestr = mdns_record_parse_ptr(data, size, offset, length,
+				namebuffer, sizeof(namebuffer));
+
+		if (debug)
+		{
+			log_message(LOG_DEBUG,
+				"%s %.*s PTR %.*s rclass 0x%x flush 0x%x "
+				"ttl %u length %lu",
+				entrytype, STRING_FORMAT(name),
+				STRING_FORMAT(namestr),
+				rclass, cf, ttl, length);
+		}
+
+		succ = mdns_record_write_ptr(pkt_mod_data, PACKET_SIZE,
+				&pkt_mod_offset, name, rclass, cf, ttl,
+				namestr);
+	}
+	else if (rtype == MDNS_RECORDTYPE_SRV) {
+		mdns_record_srv_t srv;
+
+		srv = mdns_record_parse_srv(data, size, offset, length,
+				namebuffer, sizeof(namebuffer));
+
+		if (debug)
+		{
+			log_message(LOG_DEBUG,
+				"%s %.*s SRV %.*s priority %d weight %d "
+				"port %d rclass 0x%x flush 0x%x ttl %u "
+				"length %lu",
+				entrytype, STRING_FORMAT(name),
+				STRING_FORMAT(srv.name),
+				srv.priority, srv.weight, srv.port,
+				rclass, cf, ttl, length);
+		}
+
+		succ = mdns_record_write_srv(pkt_mod_data, PACKET_SIZE,
+				&pkt_mod_offset, name, rclass, cf, ttl,
+				srv.name, srv.priority, srv.weight, srv.port);
+	}
+	else if (rtype == MDNS_RECORDTYPE_A) {
+		network_address_ipv4_t addr;
+
+		addr = mdns_record_parse_a(data, size, offset, length);
+
+		if (debug)
+		{
+			string_t addrstr;
+
+			addrstr = network_address_to_string(namebuffer,
+				sizeof(namebuffer), (network_address_t *)&addr,
+				true);
+
+			log_message(LOG_DEBUG,
+				"%s %.*s A %.*s rclass 0x%x flush 0x%x ttl %u "
+				"length %lu",
+				entrytype, STRING_FORMAT(name),
+				STRING_FORMAT(addrstr),
+				rclass, cf, ttl, length);
+		}
+
+		succ = mdns_record_write_a(pkt_mod_data, PACKET_SIZE,
+				&pkt_mod_offset, name, rclass, cf, ttl,
+				addr);
+	}
+	else if (rtype == MDNS_RECORDTYPE_AAAA) {
+		network_address_ipv6_t addr;
+
+		addr = mdns_record_parse_aaaa(data, size, offset, length);
+
+		if (debug)
+		{
+			string_t addrstr;
+
+			addrstr = network_address_to_string(namebuffer,
+				sizeof(namebuffer), (network_address_t *)&addr,
+				true);
+
+			log_message(LOG_DEBUG,
+				"%s %.*s AAAA %.*s rclass 0x%x flush 0x%x "
+				" ttl %u length %lu",
+				entrytype, STRING_FORMAT(name),
+				STRING_FORMAT(addrstr),
+				rclass, cf, ttl, length);
+		}
+
+		if (is_ipv6_link_local_address((network_address_t *)&addr))
+		{
+			ipv6_link_local_in_packet = true;
+		}
+		else
+		{
+			succ = mdns_record_write_aaaa(pkt_mod_data, PACKET_SIZE,
+					&pkt_mod_offset, name, rclass, cf, ttl,
+					addr);
+		}
+	}
+	else if (rtype == MDNS_RECORDTYPE_TXT) {
+		mdns_record_txt_t *txtrecords;
+		size_t parsed;
+
+		txtrecords = (void *)namebuffer;
+		parsed = mdns_record_parse_txt(data, size,
+				offset, length, txtrecords,
+				sizeof(namebuffer) / sizeof(mdns_record_txt_t));
+
+		if (debug)
+		{
+			log_message(LOG_DEBUG,
+				"%s %.*s TXT rclass 0x%x flush 0x%x ttl %u "
+				"length %lu",
+				entrytype, STRING_FORMAT(name),
+				rclass, cf, ttl, length);
+
+			for (size_t itxt = 0; itxt < parsed; ++itxt) {
+				if (txtrecords[itxt].value.length) {
+					log_message(LOG_DEBUG, "- %.*s = %.*s",
+						STRING_FORMAT(
+							txtrecords[itxt].key),
+						STRING_FORMAT(
+							txtrecords[itxt].value));
+				}
+				else {
+					log_message(LOG_DEBUG, "- %.*s =",
+						STRING_FORMAT(
+							txtrecords[itxt].key));
+				}
+			}
+		}
+
+		succ = mdns_record_write_txt(pkt_mod_data, PACKET_SIZE,
+				&pkt_mod_offset, name, rclass, cf, ttl,
+				txtrecords, parsed);
+	}
+	else if (rtype == MDNS_RECORDTYPE_OPT) {
+		data_const_t rdata;
+
+		mdns_record_parse_opt(data, size, offset, length,
+			&rdata);
+
+		if (debug)
+		{
+			log_message(LOG_DEBUG,
+				"%s OPT max_udp_payload_accepted 0x%x "
+				"flush 0x%x ext_rcode_and_flags 0x%x "
+				"length %lu",
+				entrytype,
+				rclass, cf, ttl, length);
+		}
+
+		succ = mdns_record_write_opt(pkt_mod_data, PACKET_SIZE,
+				&pkt_mod_offset, rclass, cf, ttl,
+				rdata);
+	}
+	else if (rtype == MDNS_RECORDTYPE_NSEC) {
+		string_t next_domain_name;
+		data_const_t type_bitmap_data;
+
+		mdns_record_parse_nsec(data, size, offset, length,
+			&next_domain_name, namebuffer, sizeof(namebuffer),
+			&type_bitmap_data);
+
+		if (debug)
+		{
+			log_message(LOG_DEBUG,
+				"%s %.*s NSEC %.*s rclass 0x%x flush 0x%x "
+				"ttl %u length %lu",
+				entrytype, STRING_FORMAT(name),
+				STRING_FORMAT(next_domain_name),
+				rclass, cf, ttl, length);
+		}
+
+		succ = mdns_record_write_nsec(pkt_mod_data, PACKET_SIZE,
+				&pkt_mod_offset, name, rclass, cf, ttl,
+				next_domain_name, type_bitmap_data);
+	}
+	else {
+		if (debug)
+		{
+			log_message(LOG_DEBUG,
+				"%s %.*s rtype 0x%x rclass 0x%x flush 0x%x "
+				"ttl %u length %lu",
+				entrytype, STRING_FORMAT(name),
+				rtype, rclass, cf, ttl, length);
+		}
+
+		log_message(LOG_ERR,
+			"Warning: Record type 0x%x could not be parsed and thus "
+			"could not be added to the resulting packet.",
+			rtype);
+	}
+
+	if (succ == 0)
+	{
+		size_t off=0;
+		if (entry == MDNS_ENTRYTYPE_ANSWER)
+		{
+			mdns_header_increment_answer_rr_counter(
+					pkt_mod_data, PACKET_SIZE, &off);
+		}
+		else if (entry == MDNS_ENTRYTYPE_AUTHORITY)
+		{
+			mdns_header_increment_authority_rr_counter(
+					pkt_mod_data, PACKET_SIZE, &off);
+		}
+		else if (entry == MDNS_ENTRYTYPE_ADDITIONAL)
+		{
+			mdns_header_increment_additional_rr_counter(
+					pkt_mod_data, PACKET_SIZE, &off);
+		}
+	}
+
+	return 0;
 }
 
 static int create_recv_sock() {
@@ -310,8 +579,9 @@ static void daemonize() {
 }
 
 static void show_help(const char *progname) {
-	fprintf(stderr, "mDNS repeater (version " HGVERSION ")\n");
-	fprintf(stderr, "Copyright (C) 2011 Darell Tan\n\n");
+	fprintf(stderr, "mDNS repeater (version " MDNS_REPEATER_VERSION ")\n");
+	fprintf(stderr, "Copyright (C) 2011 Darell Tan\n");
+	fprintf(stderr, "Copyright (C) 2020 Matthias Dettling\n\n");
 
 	fprintf(stderr, "usage: %s [ -f ] <ifdev> ...\n", progname);
 	fprintf(stderr, "\n"
@@ -320,7 +590,8 @@ static void show_help(const char *progname) {
 					"maximum number of interfaces is 5\n"
 					"\n"
 					" flags:\n"
-					"	-f	runs in foreground for debugging\n"
+					"	-f	runs in foreground\n"
+					"	-d	log debug messages\n"
 					"	-b	blacklist subnet (eg. 192.168.1.1/24)\n"
 					"	-w	whitelist subnet (eg. 192.168.1.1/24)\n"
 					"	-p	specifies the pid file path (default: " PIDFILE ")\n"
@@ -384,10 +655,11 @@ static int parse_opts(int argc, char *argv[]) {
 	int help = 0;
 	struct subnet *ss;
 	char *msg;
-	while ((c = getopt(argc, argv, "hfp:b:w:")) != -1) {
+	while ((c = getopt(argc, argv, "hfdp:b:w:")) != -1) {
 		switch (c) {
 			case 'h': help = 1; break;
 			case 'f': foreground = 1; break;
+			case 'd': debug = true; break;
 			case 'p':
 				if (optarg[0] != '/')
 					log_message(LOG_ERR, "pid file path must be absolute");
@@ -493,7 +765,7 @@ int main(int argc, char *argv[]) {
 		exit(2);
 	}
 
-	openlog(PACKAGE, LOG_PID | LOG_CONS, LOG_DAEMON);
+	openlog(package_name, LOG_PID | LOG_CONS, LOG_DAEMON);
 	if (! foreground)
 		daemonize();
 	else {
@@ -533,6 +805,13 @@ int main(int argc, char *argv[]) {
 	pkt_data = malloc(PACKET_SIZE);
 	if (pkt_data == NULL) {
 		log_message(LOG_ERR, "cannot malloc() packet buffer: %s", strerror(errno));
+		r = 1;
+		goto end_main;
+	}
+
+	pkt_mod_data = calloc(PACKET_SIZE, sizeof(uint8_t));
+	if (pkt_mod_data == NULL) {
+		log_message(LOG_ERR, "cannot calloc() buffer for packet copy: %s", strerror(errno));
 		r = 1;
 		goto end_main;
 	}
@@ -583,8 +862,8 @@ int main(int argc, char *argv[]) {
 				}
 
 				if (!whitelisted_packet) {
-					if (foreground)
-						printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+					if (debug)
+						log_message(LOG_DEBUG, "skipping packet from=%s size=%zd", inet_ntoa(fromaddr.sin_addr), recvsize);
 					continue;
 				}
 			} else {
@@ -598,32 +877,57 @@ int main(int argc, char *argv[]) {
 				}
 
 				if (blacklisted_packet) {
-					if (foreground)
-						printf("skipping packet from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+					if (debug)
+						log_message(LOG_DEBUG, "skipping packet from=%s size=%zd", inet_ntoa(fromaddr.sin_addr), recvsize);
 					continue;
 				}
 			}
 
-			if (foreground)
-				printf("data from=%s size=%zd\n", inet_ntoa(fromaddr.sin_addr), recvsize);
+			if (debug)
+				log_message(LOG_DEBUG, "data from=%s size=%zd", inet_ntoa(fromaddr.sin_addr), recvsize);
+
+			ipv6_link_local_in_packet = false;
+
+			pkt_mod_offset = 0;
+			pkt_mod_len = 0;
+			memset(pkt_mod_data, 0, PACKET_SIZE);
+
+			mdns_pdu_parse(pkt_data, (size_t)recvsize,
+			filtercopy_header_callback_fn,
+			filtercopy_question_callback_fn,
+			filtercopy_record_callback_fn);
+			pkt_mod_len = pkt_mod_offset;
+
+			if(debug && ipv6_link_local_in_packet)
+			{
+				log_message(LOG_DEBUG,
+					"IPv6 link local address in packet. "
+					"Will send filtered copy of packet.");
+			}
 
 			for (j = 0; j < num_socks; j++) {
 				// do not repeat packet back to the same network from which it originated
 				if ((fromaddr.sin_addr.s_addr & socks[j].mask.s_addr) == socks[j].net.s_addr)
 					continue;
 
-				if (foreground)
-					printf("repeating data to %s\n", socks[j].ifname);
+				if (debug)
+					log_message(LOG_DEBUG, "repeating data to %s", socks[j].ifname);
 
 				// repeat data
-				ssize_t sentsize = send_packet(socks[j].sockfd, pkt_data, (size_t) recvsize);
-				if (sentsize != recvsize) {
-					if (sentsize < 0)
-						log_message(LOG_ERR, "send(): %s", strerror(errno));
-					else
-						log_message(LOG_ERR, "send_packet size differs: sent=%zd actual=%zd",
-							recvsize, sentsize);
+				ssize_t sentsize;
+				if(ipv6_link_local_in_packet)
+				{
+					// send modified copy of packet
+					sentsize = send_packet(socks[j].sockfd, pkt_mod_data, pkt_mod_len);
 				}
+				else
+				{
+					// send original packet
+					sentsize = send_packet(socks[j].sockfd, pkt_data, (size_t)recvsize);
+				}
+
+				if (sentsize < 0)
+					log_message(LOG_ERR, "send(): %s", strerror(errno));
 			}
 		}
 	}
@@ -634,6 +938,9 @@ end_main:
 
 	if (pkt_data != NULL)
 		free(pkt_data);
+
+	if (pkt_mod_data != NULL)
+		free(pkt_mod_data);
 
 	if (server_sockfd >= 0)
 		close(server_sockfd);
