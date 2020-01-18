@@ -1,0 +1,16 @@
+[Unit]
+Description=mdns-repeater
+After=network.target syslog.service
+ConditionPathExists=/etc/default/mdns-repeater
+
+[Service]
+Type=forking
+EnvironmentFile=-/etc/default/mdns-repeater
+ExecStart=/usr/local/bin/mdns-repeater $MDNS_REPEATER_OPTS
+PIDFile=/var/run/mdns-repeater.pid
+KillMode=process
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+Alias=mdns-repeater.service
